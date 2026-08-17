@@ -398,6 +398,43 @@ def test_report_writer_files(tmp_path):
     assert "(+1 deliberate route omissions)" in summary
 
 
+def test_deliberate_skip_rule_suppressed_from_summary(tmp_path, caplog):
+    """Explicit-reason skip rules flow through parse(): route records are
+    tagged deliberate, hidden from summary.txt, still in events.jsonl, and
+    still logged as WARNINGs (record-time, not report-render time)."""
+    import logging
+
+    from serviette.indexer.graph import (
+        ParserRegistry, _IngestionReportWriter,
+    )
+    from serviette.config.schema import ParserRule
+
+    rules = [
+        ParserRule(
+            match=["*.mp4", "*.mkv", "*.mov"],
+            type="skip",
+            options={"reason": "video handled by vidprep upstream"},
+        )
+    ]
+    reg = ParserRegistry(rules)
+    reg.report_writer = _IngestionReportWriter(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="serviette.indexer.graph"):
+        reg.parse(b"\x00fake", ".mp4", "demo.mp4", "/path/demo.mp4")
+
+    run_dirs = list(tmp_path.glob("ingestion_*"))
+    assert len(run_dirs) == 1
+    events = [json.loads(line) for line in
+              (run_dirs[0] / "events.jsonl").read_text().strip().splitlines()]
+    assert len(events) == 1
+    assert events[0]["deliberate"] is True
+    assert events[0]["reason"] == "skip: video handled by vidprep upstream"
+    summary = (run_dirs[0] / "summary.txt").read_text()
+    assert "demo.mp4" not in summary
+    assert "(+1 deliberate route omissions)" in summary
+    assert any("demo.mp4" in r.message for r in caplog.records
+               if r.levelno >= logging.WARNING)
+
+
 def test_unknown_parser_type_rejected_at_startup():
     """check_rule_deps rejects names that are neither built-in, registered, nor skip."""
     from serviette.indexer.graph import ParserRegistry

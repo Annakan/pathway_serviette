@@ -43,7 +43,7 @@ def pdf_bytes() -> bytes:
 
 def test_pdf_parses_locally(registry, pdf_bytes):
     """PDF text extraction with the best available keyless parser."""
-    kind, _ = registry._route(".pdf", "report.pdf")
+    kind, *_ = registry._route(".pdf", "report.pdf")
     assert kind == ("docling" if _has("docling") else "pypdf")
     text = "\n\n".join(t for t, _ in registry.parse(pdf_bytes, ".pdf", "report.pdf"))
     assert "twenty-six million pages" in text
@@ -95,7 +95,7 @@ def test_scanned_image_ocr(registry):
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
 
-    kind, _ = registry._route(".png", "scan.png")
+    kind, *_ = registry._route(".png", "scan.png")
     assert kind == "paddle_ocr"
     text = "\n\n".join(t for t, _ in registry.parse(buffer.getvalue(), ".png", "scan.png"))
     assert "SERVIETTE" in text.upper()

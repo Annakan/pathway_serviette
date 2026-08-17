@@ -280,7 +280,7 @@ def test_parser_user_rules_win_and_fall_through(monkeypatch):
     # Explicit rule beats the docling default.
     assert reg._route(".pdf", "a.pdf")[0] == "pypdf"
     # Explicit rule enables video even without the env key (key in options/env at runtime).
-    kind, options = reg._route(".mp4", "demo.mp4")
+    kind, options, _matched = reg._route(".mp4", "demo.mp4")
     assert kind == "twelvelabs_video" and options["prompt"] == "Describe"
     # Unmatched files fall through to defaults.
     assert reg._route(".txt", "a.txt")[0] == "utf8"

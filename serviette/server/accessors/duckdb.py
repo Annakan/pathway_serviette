@@ -179,7 +179,8 @@ class DuckDbAccessor(KeywordHybridMixin, AsyncVectorAccessor):
         try:
             chunks, documents, last = conn.execute(
                 f"SELECT count(*),"
-                f"  count(DISTINCT json_extract_string(metadata, '$.path')),"
+                f"  count(DISTINCT coalesce(json_extract_string(metadata, '$.path'),"
+                f"  json_extract_string(metadata, '$.source_file'))),"
                 f"  max(TRY_CAST(json_extract(metadata, '$.seen_at') AS BIGINT)) "
                 f'FROM "{self._table}"'
             ).fetchone()
