@@ -101,12 +101,15 @@ class _IngestionReportWriter:
         self._rewrite_summary()
 
     def _rewrite_summary(self) -> None:
+        shown = [r for r in self._records if not r.get("deliberate")]
+        omitted = len(self._records) - len(shown)
         counts: dict[str, int] = {}
-        for rec in self._records:
+        for rec in shown:
             key = f"{rec['stage']}/{rec['action']}"
             counts[key] = counts.get(key, 0) + 1
         lines = [
-            f"Ingestion report — {len(self._records)} record(s)",
+            f"Ingestion report — {len(shown)} record(s)"
+            + (f" (+{omitted} deliberate route omissions)" if omitted else ""),
             "",
             "Counts by class:",
             *(f"  {k}: {v}" for k, v in sorted(counts.items())),
@@ -116,7 +119,7 @@ class _IngestionReportWriter:
                 f"  [{r['ts']}] {r['stage']}/{r['action']} {r['file']}"
                 + (f" ({r['chunk_locator']})" if r.get("chunk_locator") else "")
                 + f" — {r['reason']}"
-                for r in self._records
+                for r in shown
             ),
         ]
         self._summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -286,7 +289,11 @@ class ParserRegistry:
                 return modality
         return "office"
 
-    def _route(self, suffix: str, name: str, path: str = "") -> tuple[str, dict]:
+    def _route(self, suffix: str, name: str, path: str = "") -> tuple[str, dict, bool]:
+        """Resolve (kind, options, matched_rule). ``matched_rule`` is True
+        when a config rule (not the environment default) resolved the file —
+        the deliberate/accidental distinction for route skips (M2 report)."""
+
         # Match against both the basename and the full connector path so
         # path-aware rules (*.vidprep/bundle.yaml) work alongside legacy
         # basename globs (*.mp4). fnmatch's * crosses "/", so both shapes
@@ -296,8 +303,8 @@ class ParserRegistry:
             if any(
                 fnmatch.fnmatch(c, pat) for c in candidates for pat in rule.match
             ):
-                return rule.type, dict(rule.options)
-        return self._default_for(self._modality_for(suffix))
+                return rule.type, dict(rule.options), True
+        return *self._default_for(self._modality_for(suffix)), False
 
     def _get(self, kind: str, options: dict):
         key = (kind, tuple(sorted(options.items())))
@@ -337,13 +344,19 @@ class ParserRegistry:
         """Parse ``contents`` into ``[(text, meta), ...]`` preserving
         per-element metadata (M2). Skip/failure → ``[]`` (was ``""``)."""
 
-        kind, options = self._route(suffix, name, path)
+        kind, options, matched_rule = self._route(suffix, name, path)
         if kind == "skip":
             reason = options.get("reason", "no parser configured")
             self._record_event(
                 file=name or path or suffix, path=path,
                 stage="route", action="skip_file",
                 reason=f"skip: {reason}",
+                # A config skip RULE is a deliberate exclusion (video
+                # upstream, bundle internal, corpus exclusions) — the
+                # summary suppresses it. Skips resolved from the
+                # environment default (keyless-first fallback) stay
+                # visible: they signal a gap, not intent.
+                deliberate=matched_rule,
             )
             return []
         options.pop("reason", None)
@@ -494,7 +507,7 @@ class ParserRegistry:
     def pre_chunked(self, suffix: str, name: str, path: str = "") -> bool:
         """True when the routed parser's elements bypass the splitter."""
 
-        kind, options = self._route(suffix, name, path)
+        kind, options, _ = self._route(suffix, name, path)
         if kind == "skip":
             return False
         options.pop("reason", None)
@@ -514,6 +527,7 @@ class ParserRegistry:
         reason: str,
         parser: str | None = None,
         chunk_locator: str | None = None,
+        deliberate: bool = False,
     ) -> None:
         """Append one ingestion-report record, log a per-file WARNING, and
         mirror to the on-disk report when a writer is attached.
@@ -537,6 +551,8 @@ class ParserRegistry:
             rec["parser"] = parser
         if chunk_locator is not None:
             rec["chunk_locator"] = chunk_locator
+        if deliberate:
+            rec["deliberate"] = True
         self._ingestion_records.append(rec)
         logger.warning(
             "Ingestion %s/%s %r%s — %s",

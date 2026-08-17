@@ -368,29 +368,34 @@ def test_context_record_callback():
 
 
 def test_report_writer_files(tmp_path):
-    """The on-disk report mirrors records: events.jsonl + summary.txt
-    with matching counts (M2 §Error recording)."""
+    """The on-disk report mirrors records: events.jsonl holds everything;
+    summary.txt suppresses deliberate route omissions (explicit rule
+    reasons) while keeping gap-signals like 'no parser configured'."""
     from serviette.indexer.graph import (
         ParserRegistry, _IngestionReportWriter,
     )
+    from serviette.config.schema import ParserRule
 
     reg = ParserRegistry()
     reg.report_writer = _IngestionReportWriter(tmp_path)
+    # Gap-signal (no explicit reason) → visible in the summary.
     reg.parse(b"\x00fake", ".mp4", "demo.mp4", "/path/demo.mp4")
-    reg.parse(b"\x00fake", ".mkv", "other.mkv", "/path/other.mkv")
+    # Deliberate omission (explicit reason) → events.jsonl only.
+    reg._record_event(
+        file="foo.mkv", path="/path/foo.mkv",
+        stage="route", action="skip_file",
+        reason="skip: video handled by vidprep upstream",
+        deliberate=True,
+    )
 
     run_dirs = list(tmp_path.glob("ingestion_*"))
     assert len(run_dirs) == 1
     events = (run_dirs[0] / "events.jsonl").read_text().strip().splitlines()
-    assert len(events) == 2
-    parsed = [json.loads(line) for line in events]
-    assert {r["file"] for r in parsed} == {"demo.mp4", "other.mkv"}
-    assert all(r["stage"] == "route" and r["action"] == "skip_file"
-               for r in parsed)
-    assert all("ts" in r for r in parsed)
+    assert len(events) == 2  # both recorded
     summary = (run_dirs[0] / "summary.txt").read_text()
-    assert "route/skip_file: 2" in summary
-    assert "demo.mp4" in summary and "other.mkv" in summary
+    assert "demo.mp4" in summary
+    assert "foo.mkv" not in summary
+    assert "(+1 deliberate route omissions)" in summary
 
 
 def test_unknown_parser_type_rejected_at_startup():
@@ -425,7 +430,7 @@ def test_path_aware_routing():
     rules = [ParserRule(match=["*.vidprep/bundle.yaml"], type="fake_pre")]
     reg = ParserRegistry(rules)
     # basename "bundle.yaml" alone doesn't match; the full path does.
-    kind, _ = reg._route(".yaml", "bundle.yaml", "/data/X.mp4.vidprep/bundle.yaml")
+    kind, _, _too = reg._route(".yaml", "bundle.yaml", "/data/X.mp4.vidprep/bundle.yaml")
     assert kind == "fake_pre"
 
 
