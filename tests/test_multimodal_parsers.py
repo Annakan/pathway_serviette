@@ -45,7 +45,7 @@ def test_pdf_parses_locally(registry, pdf_bytes):
     """PDF text extraction with the best available keyless parser."""
     kind, _ = registry._route(".pdf", "report.pdf")
     assert kind == ("docling" if _has("docling") else "pypdf")
-    text = registry.parse(pdf_bytes, ".pdf", "report.pdf")
+    text = "\n\n".join(t for t, _ in registry.parse(pdf_bytes, ".pdf", "report.pdf"))
     assert "twenty-six million pages" in text
 
 
@@ -72,7 +72,7 @@ def test_docx_parses_via_unstructured(registry):
     document.add_paragraph("Deletion semantics propagate to the vector store.")
     document.save(buffer)
 
-    text = registry.parse(buffer.getvalue(), ".docx", "notes.docx")
+    text = "\n\n".join(t for t, _ in registry.parse(buffer.getvalue(), ".docx", "notes.docx"))
     assert "Deletion semantics" in text
 
 
@@ -97,6 +97,6 @@ def test_scanned_image_ocr(registry):
 
     kind, _ = registry._route(".png", "scan.png")
     assert kind == "paddle_ocr"
-    text = registry.parse(buffer.getvalue(), ".png", "scan.png")
+    text = "\n\n".join(t for t, _ in registry.parse(buffer.getvalue(), ".png", "scan.png"))
     assert "SERVIETTE" in text.upper()
     assert "SCANS" in text.upper()

@@ -44,6 +44,7 @@ import pathway as pw
 
 from serviette.config.schema import ServietteConfig
 from serviette.indexer.sources import Fetcher, make_fetcher, read_source
+from serviette.indexer import parsers as _parser_plugins
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,11 @@ class ParserRegistry:
         self._instances: dict[Any, Any] = {}
         self._defaults: dict[str, tuple[str, dict]] = {}
         self._warned: set[str] = set()
+        # Ingestion report: every file that never reaches the vector store
+        # (route-skip, fetch error, parse failure, normalization failure) —
+        # the in-memory record list behind ``ingestion_report()`` (M2).
+        # Deduped warnings stay as-is.
+        self._ingestion_records: list[dict[str, str]] = []
 
     # -- keyless-first defaults ------------------------------------------------
 
@@ -167,6 +173,15 @@ class ParserRegistry:
         "paddle_ocr": ("paddleocr", 'pip install "serviette[ocr]"'),
     }
 
+    # Every built-in parser kind (the classes dict in ``_get``). Used by
+    # ``check_rule_deps`` to reject unknown names — including registered
+    # extension parsers — at startup. Kept as a static set so validation
+    # does not import pathway.
+    _BUILTIN_KINDS: ClassVar[frozenset[str]] = frozenset({
+        "utf8", "pypdf", "docling", "unstructured", "paddle_ocr",
+        "vision_image", "vision_slide", "whisper", "twelvelabs_video",
+    })
+
     def check_rule_deps(self) -> None:
         """Validate that every explicit rule's parser can actually be built."""
 
@@ -178,6 +193,21 @@ class ParserRegistry:
                     f"parser rule {rule.match} -> {rule.type!r} needs the "
                     f"{module!r} package, which is not installed — {hint}"
                 )
+            # Reject names that are neither built-in, registered, nor skip —
+            # at startup, before the pipeline meets the first matching file.
+            if rule.type == "skip" or rule.type in self._BUILTIN_KINDS:
+                continue
+            if rule.type in _parser_plugins.registered_parsers():
+                continue
+            known = sorted({
+                *self._BUILTIN_KINDS,
+                *_parser_plugins.registered_parsers(),
+                "skip",
+            })
+            raise ValueError(
+                f"parser rule {rule.match} -> {rule.type!r} is unknown. "
+                f"Known types: {', '.join(known)}"
+            )
 
     def resolved_rules(self) -> list[dict]:
         """Full routing picture (user rules + resolved defaults) for the
@@ -205,69 +235,159 @@ class ParserRegistry:
                 return modality
         return "office"
 
-    def _route(self, suffix: str, name: str) -> tuple[str, dict]:
+    def _route(self, suffix: str, name: str, path: str = "") -> tuple[str, dict]:
+        # Match against both the basename and the full connector path so
+        # path-aware rules (*.vidprep/bundle.yaml) work alongside legacy
+        # basename globs (*.mp4). fnmatch's * crosses "/", so both shapes
+        # keep matching. ``name or path`` so path-only connectors still route.
+        candidates = [c for c in (name, path) if c] or [f"x{suffix}"]
         for rule in self._rules:
-            if any(fnmatch.fnmatch(name or f"x{suffix}", pat) for pat in rule.match):
+            if any(
+                fnmatch.fnmatch(c, pat) for c in candidates for pat in rule.match
+            ):
                 return rule.type, dict(rule.options)
         return self._default_for(self._modality_for(suffix))
 
     def _get(self, kind: str, options: dict):
         key = (kind, tuple(sorted(options.items())))
         if key not in self._instances:
-            from pathway.xpacks.llm import parsers
-
-            classes = {
-                "utf8": parsers.Utf8Parser,
-                "pypdf": parsers.PypdfParser,
-                "docling": parsers.DoclingParser,
-                "unstructured": parsers.UnstructuredParser,
-                "paddle_ocr": parsers.PaddleOCRParser,
-                "vision_image": parsers.ImageParser,
-                "vision_slide": parsers.SlideParser,
-                "whisper": parsers.AudioParser,
-                "twelvelabs_video": parsers.TwelveLabsVideoParser,
-            }
-            self._instances[key] = classes[kind](**options)
+            self._instances[key] = self._resolve_class(kind)(**options)
         return self._instances[key]
 
-    def parse(self, contents: bytes, suffix: str, name: str = "") -> str:
-        kind, options = self._route(suffix, name)
+    @staticmethod
+    def _resolve_class(kind: str) -> type:
+        """Built-in xpack classes first, then registered extension parsers."""
+        from pathway.xpacks.llm import parsers
+
+        builtin = {
+            "utf8": parsers.Utf8Parser,
+            "pypdf": parsers.PypdfParser,
+            "docling": parsers.DoclingParser,
+            "unstructured": parsers.UnstructuredParser,
+            "paddle_ocr": parsers.PaddleOCRParser,
+            "vision_image": parsers.ImageParser,
+            "vision_slide": parsers.SlideParser,
+            "whisper": parsers.AudioParser,
+            "twelvelabs_video": parsers.TwelveLabsVideoParser,
+        }
+        if kind in builtin:
+            return builtin[kind]
+        registered = _parser_plugins.registered_parsers()
+        if kind in registered:
+            return registered[kind]
+        known = sorted({*builtin, *registered, "skip"})
+        raise KeyError(
+            f"Unknown parser type {kind!r}. Known: {', '.join(known)}"
+        )
+
+    def parse(
+        self, contents: bytes, suffix: str, name: str = "", path: str = ""
+    ) -> list[tuple[str, dict]]:
+        """Parse ``contents`` into ``[(text, meta), ...]`` preserving
+        per-element metadata (M2). Skip/failure → ``[]`` (was ``""``)."""
+
+        kind, options = self._route(suffix, name, path)
         if kind == "skip":
             reason = options.get("reason", "no parser configured")
-            if reason not in self._warned:
-                self._warned.add(reason)
-                logger.warning("Skipping %r files — %s", suffix, reason)
-            return ""
+            self._record_event(name or path or suffix, path, f"skip: {reason}")
+            return []
         options.pop("reason", None)
         try:
             parser = self._get(kind, options)
-        except ImportError as exc:
+        except (ImportError, KeyError) as exc:
             # Routing guards make this unreachable for the defaults, and
             # check_rule_deps() for explicit rules — this net catches lazy
             # imports inside the xpack parsers themselves. One file must
             # never kill the pipeline.
-            reason = f"parser {kind!r} unavailable: {exc}"
-            if reason not in self._warned:
-                self._warned.add(reason)
-                logger.warning("Skipping %r files — %s", suffix, reason)
-            return ""
-        try:
-            result = parser.__wrapped__(contents)
-            if inspect.isawaitable(result):
-                # Some xpack parsers return a bare Awaitable rather than a Coroutine.
-                result = asyncio.run(result)  # type: ignore[arg-type]
-        except Exception as exc:  # noqa: BLE001 - one bad file must never kill the pipeline
-            logger.warning(
-                "Failed to parse %r with the %r parser: %s — file skipped",
-                name or suffix,
-                kind,
-                exc,
+            self._record_event(
+                name or path or suffix, path, f"parser {kind!r} unavailable: {exc}"
             )
-            return ""
-        # result is list[(text, metadata)]; concatenate element texts — our own
-        # splitter re-chunks downstream. str() because some parsers return
-        # str-like objects (e.g. PaddleOCR's MarkdownResult), not plain str.
-        return "\n\n".join(str(text) for text, _meta in result if text)
+            return []
+        context = {"path": path, "name": name, "metadata": {}}
+        try:
+            # Registered parsers may define parse(contents, context) with
+            # takes_context=True (vidprep_bundle needs the path to find
+            # sibling deliverables); xpack parsers use __wrapped__(contents).
+            if getattr(parser, "takes_context", False):
+                result = parser.parse(contents, context)
+            else:
+                result = parser.__wrapped__(contents)
+                if inspect.isawaitable(result):
+                    # Some xpack parsers return a bare Awaitable rather than a Coroutine.
+                    result = asyncio.run(result)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001 - one bad file must never kill the pipeline
+            self._record_event(
+                name or path or suffix, path,
+                f"parse failure ({kind!r}): {exc}",
+            )
+            return []
+        return self._normalize_elements(result, kind, name, path, suffix)
+
+    def _normalize_elements(
+        self,
+        result,
+        kind: str,
+        name: str,
+        path: str,
+        suffix: str,
+    ) -> list[tuple[str, dict]]:
+        """Coerce element texts and apply the element-mapper chain (KB
+        normalization + validation). A mapper raising fails the *file*
+        (recorded + skipped, never reaching the store); ``None`` drops the
+        element. Without mappers, native per-element metadata rides through."""
+
+        mappers = _parser_plugins.element_mappers()
+        source_meta = {"name": name, "path": path}
+        elements: list[tuple[str, dict]] = []
+        for text, meta in result:
+            text = str(text) if text else ""
+            if not text:
+                continue
+            meta = dict(meta) if meta else {}
+            if mappers:
+                try:
+                    mapped: dict | None = None
+                    for mapper in mappers:
+                        mapped = mapper(text, meta, source_meta, kind)
+                        if mapped is not None:
+                            break
+                except Exception as exc:  # noqa: BLE001 - normalization failure = file skip
+                    self._record_event(
+                        name or path or suffix, path,
+                        f"metadata normalization failure ({kind!r}): {exc}",
+                    )
+                    return []
+                if mapped is None:
+                    continue
+                meta = mapped
+            elements.append((text, meta))
+        return elements
+
+    def pre_chunked(self, suffix: str, name: str, path: str = "") -> bool:
+        """True when the routed parser's elements bypass the splitter."""
+
+        kind, options = self._route(suffix, name, path)
+        if kind == "skip":
+            return False
+        options.pop("reason", None)
+        try:
+            parser = self._get(kind, options)
+        except (ImportError, KeyError):
+            return False
+        return bool(getattr(parser, "pre_chunked", False))
+
+    def _record_event(self, name: str, path: str, reason: str) -> None:
+        """Log once per unique reason; always append to the ingestion report."""
+
+        if reason not in self._warned:
+            self._warned.add(reason)
+            logger.warning("Skipping %r — %s", name, reason)
+        self._ingestion_records.append({"name": name, "path": path, "reason": reason})
+
+    def ingestion_report(self) -> list[dict[str, str]]:
+        """Every file that never reached the vector store (M2 report)."""
+
+        return list(self._ingestion_records)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +506,10 @@ def build_graph(
 
     config.for_indexer()
 
+    # Load KB parser plugins (config-driven; idempotent per process) before
+    # the registry is built so check_rule_deps sees registered types.
+    _parser_plugins.load_plugins(config)
+
     registry = ParserRegistry(config.parser)
     registry.check_rule_deps()
     splitter = splitter if splitter is not None else build_xpack_splitter(config.splitter)
@@ -402,16 +526,35 @@ def build_graph(
 
     def make_parse_udf(fetcher: Fetcher):
         @pw.udf(deterministic=False, cache_strategy=cache_strategy)
-        def parse_document(metadata: pw.Json) -> str:
+        def parse_document(metadata: pw.Json) -> list[tuple[str, dict]]:
             meta = _json_to_dict(metadata)
             try:
                 contents, suffix = fetcher.fetch(meta)
             except Exception as exc:  # noqa: BLE001 - object may have vanished / be unreadable
                 logger.warning("Could not fetch source object %s: %s", meta, exc)
-                return ""
-            return registry.parse(contents, suffix, str(meta.get("name", "")))
+                registry._record_event(
+                    str(meta.get("name", "")), str(meta.get("path", "")),
+                    f"fetch failure: {exc}",
+                )
+                return []
+            return registry.parse(
+                contents, suffix,
+                str(meta.get("name", "")), str(meta.get("path", "")),
+            )
 
         return parse_document
+
+    @pw.udf(deterministic=True)
+    def doc_pre_chunked(metadata: pw.Json) -> bool:
+        """Route-only check: does this file's parser bypass the splitter?
+
+        Cheaper than parse (no byte fetch); the suffix is derived the same
+        way every Fetcher does — ``Path(path or name).suffix``."""
+        meta = _json_to_dict(metadata)
+        name = str(meta.get("name", ""))
+        path = str(meta.get("path", ""))
+        suffix = os.path.splitext(path or name)[1]
+        return registry.pre_chunked(suffix, name, path)
 
     # Pure-function whitelist: for these splitter types re-running the UDF is
     # guaranteed to reproduce the original chunks, so the engine need not
@@ -422,15 +565,42 @@ def build_graph(
     split_is_pure = config.splitter.type in _PURE_SPLITTERS
 
     @pw.udf(deterministic=split_is_pure)
-    def split_text(text: str) -> list[str]:
-        if not text:
+    def split_elements(
+        elements: list[tuple[str, dict]], pre_chunked: bool
+    ) -> list[tuple[str, dict]]:
+        """Split each element's text (propagating its metadata to every
+        sub-chunk) unless the parser marked the input pre-chunked — then
+        elements pass through verbatim (vidprep events are already retrieval
+        units). Empty texts are dropped."""
+        if not elements:
             return []
-        return [chunk for chunk, _meta in splitter.chunk(text)]
+        out: list[tuple[str, dict]] = []
+        if pre_chunked:
+            for text, meta in elements:
+                if text:
+                    out.append((str(text), _json_to_dict(meta) if meta else {}))
+            return out
+        for text, meta in elements:
+            if not text:
+                continue
+            meta = _json_to_dict(meta) if meta else {}
+            for chunk_text, chunk_meta in splitter.chunk(str(text), meta):
+                if chunk_text:
+                    out.append((str(chunk_text), dict(chunk_meta)))
+        return out
+
+    @pw.udf(deterministic=True)
+    def merge_metadata(source: pw.Json, element: pw.Json) -> dict:
+        """Merge file-level source metadata with per-chunk element metadata
+        (element wins on conflict)."""
+        return {**_json_to_dict(source), **_json_to_dict(element)}
 
     @pw.udf(deterministic=True)
     def make_id(meta_json: str, text: str) -> str:
-        # meta_json is the canonical per-document serialization from
-        # _metadata_as_json, so the id is reproducible for (metadata, text).
+        # meta_json is the canonical per-CHUNK serialization (source + element
+        # metadata merged), so the id is reproducible for (chunk metadata, text).
+        # Per-chunk (was per-document): two chunks with identical text but
+        # different locators (page, timecode) now get distinct ids.
         digest = hashlib.sha256()
         digest.update(meta_json.encode("utf-8"))
         digest.update(b"\x00")
@@ -439,13 +609,18 @@ def build_graph(
 
     # -- per-source: read (only_metadata) -> parse ----------------------------
     # Each source gets its own fetcher-bound parse UDF; parsed tables share the
-    # (_metadata, text) schema and are concatenated before splitting/embedding.
+    # (_metadata, elements, pre_chunked) schema and are concatenated before
+    # splitting/embedding.
     parsed_tables: list[pw.Table] = []
     for i, src in enumerate(config.sources):
         table = read_source(src, name=f"source_{i}")
         parse_document = make_parse_udf(make_fetcher(src))
         parsed_tables.append(
-            table.select(_metadata=pw.this._metadata, text=parse_document(pw.this._metadata))
+            table.select(
+                _metadata=pw.this._metadata,
+                elements=parse_document(pw.this._metadata),
+                pre_chunked=doc_pre_chunked(pw.this._metadata),
+            )
         )
 
     parsed = (
@@ -455,31 +630,49 @@ def build_graph(
     )
 
     # -- split -> flatten -> embed -------------------------------------------
-    # The canonical metadata JSON is computed once per DOCUMENT here; flatten
-    # then replicates the reference per chunk instead of re-serializing the
-    # same dict for every chunk.
+    # Per-chunk metadata (M2): split produces [(text, meta)] pairs; flatten
+    # expands them. The stored metadata depends on whether an element mapper
+    # is registered:
+    # - Mapper active (KB ingestion): store the chunk's element metadata
+    #   *verbatim* — the mapper already produced the validated frozen envelope
+    #   (additionalProperties: false), and merging the fs connector's source
+    #   _metadata (path/owner/size/mtime/…) on top would violate the schema
+    #   and store something other than what was validated.
+    # - No mapper (vanilla serviette): merge source _metadata with element
+    #   metadata so parser-native keys (page_number/pages) ride through.
+    # meta_json / chunk_id are derived from whichever metadata is stored, so
+    # the id is reproducible for (stored metadata, text) in both paths.
+    # Pathway tuple indexing ([0]/[1]) follows the DocumentStore pattern
+    # (xpacks/llm/document_store.py).
     chunked = parsed.select(
         _metadata=pw.this._metadata,
-        meta_json=_metadata_as_json(pw.this._metadata),
-        chunk=split_text(pw.this.text),
+        chunk=split_elements(pw.this.elements, pw.this.pre_chunked),
     )
     exploded = chunked.flatten(pw.this.chunk)
     # Asymmetric-retrieval models (e5, bge) want a marker prepended to the
     # embedded text only; chunk_id and the stored text stay prefix-free.
     assert config.embedder is not None  # enforced by for_indexer()
     doc_prefix = config.embedder.document_prefix
+    chunk_text = pw.this.chunk[0]
+    chunk_meta = pw.this.chunk[1]
+    if _parser_plugins.element_mappers():
+        # KB path: the envelope is the contract — store it alone.
+        stored_meta = chunk_meta
+    else:
+        stored_meta = merge_metadata(pw.this._metadata, chunk_meta)
+    meta_json = _metadata_as_json(stored_meta)
     embed_input = (
-        pw.apply_with_type(lambda t, _p=doc_prefix: _p + t, str, pw.this.chunk)
+        pw.apply_with_type(lambda t, _p=doc_prefix: _p + t, str, chunk_text)
         if doc_prefix
-        else pw.this.chunk
+        else chunk_text
     )
     # Pathway reserves the column name "id", so the chunk's primary key lives in
     # "chunk_id"; the sinks map it to each backend's id/primary-key field.
     embedded = exploded.select(
-        chunk_id=make_id(pw.this.meta_json, pw.this.chunk),
-        text=pw.this.chunk,
-        metadata=pw.this._metadata,
-        metadata_json=pw.this.meta_json,
+        chunk_id=make_id(meta_json, chunk_text),
+        text=chunk_text,
+        metadata=stored_meta,
+        metadata_json=meta_json,
         embedding=embedder(embed_input),
     )
 
@@ -543,10 +736,10 @@ def _write_sink(table: pw.Table, config: ServietteConfig) -> None:
 def _metadata_as_json(metadata: pw.Json) -> str:
     """Serialize the metadata dict to one canonical JSON string.
 
-    Computed once per *document* (before chunk flattening) and reused for
-    every chunk: as the string form stored by backends whose record metadata
-    must be scalar (duckdb/chroma/weaviate/pinecone), and as the metadata part
-    of the chunk id hash. sort_keys/ensure_ascii keep it byte-stable.
+    Computed per *chunk* (M2: merged source + element metadata) and used as
+    the string form stored by backends whose record metadata must be scalar
+    (duckdb/chroma/weaviate/pinecone) and as the metadata part of the chunk
+    id hash. sort_keys/ensure_ascii keep it byte-stable.
     """
 
     return json.dumps(_json_to_dict(metadata), sort_keys=True, ensure_ascii=True)

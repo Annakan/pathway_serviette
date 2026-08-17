@@ -88,6 +88,7 @@ def build_fingerprint(config: ServietteConfig) -> dict[str, Any]:
 
     return {
         "splitter": config.splitter.model_dump(),
+        "parser_plugins": list(config.parser_plugins),
         "parser": ParserRegistry(config.parser).resolved_rules(),
         "embedder": {
             # Identity only — never credentials.

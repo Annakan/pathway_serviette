@@ -289,7 +289,7 @@ def test_parser_user_rules_win_and_fall_through(monkeypatch):
 def test_parser_skip_produces_empty_text(monkeypatch, caplog):
     monkeypatch.delenv("TWELVELABS_API_KEY", raising=False)
     reg = _registry()
-    assert reg.parse(b"\x00fakevideo", ".mp4", "demo.mp4") == ""
+    assert reg.parse(b"\x00fakevideo", ".mp4", "demo.mp4") == []
     assert any("Skipping" in r.message for r in caplog.records)
 
 
@@ -312,7 +312,7 @@ def test_parser_missing_lazy_import_skips_instead_of_crashing(caplog):
     # Force the route to a parser whose import will genuinely fail: the
     # safety net must convert the ImportError into a warning + empty text.
     reg = _registry(importable={"unstructured"})
-    assert reg.parse(b"PK\x03\x04fake-docx", ".docx", "a.docx") == ""
+    assert reg.parse(b"PK\x03\x04fake-docx", ".docx", "a.docx") == []
     assert any("unavailable" in r.message for r in caplog.records)
 
 

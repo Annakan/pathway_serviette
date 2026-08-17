@@ -163,18 +163,15 @@ class ParserRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     match: list[str] = Field(min_length=1)
-    type: Literal[
-        "utf8",
-        "pypdf",
-        "docling",
-        "unstructured",
-        "paddle_ocr",
-        "vision_image",
-        "vision_slide",
-        "whisper",
-        "twelvelabs_video",
-        "skip",
-    ]
+    type: str = Field(
+        description=(
+            "Parser type: a built-in ('utf8', 'pypdf', 'docling', "
+            "'unstructured', 'paddle_ocr', 'vision_image', 'vision_slide', "
+            "'whisper', 'twelvelabs_video'), 'skip', or a name registered via "
+            "the parser-plugins extension point (serviette.indexer.parsers). "
+            "Unknown names fail at startup (check_rule_deps)."
+        )
+    )
     options: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -639,6 +636,12 @@ class ServietteConfig(BaseModel):
     # docling > pypdf for PDF, PaddleOCR for images) and skipping modalities
     # whose only parser needs an absent API key (audio, video) with a warning.
     parser: list[ParserRule] | None = None
+    # Parser plugins: dotted module paths imported at indexer startup so a KB
+    # (raivisor) can register custom parsers + a metadata-normalization mapper
+    # without serviette importing KB code (dependency direction). Each module's
+    # ``register(config)`` is called if defined. Survives ``serviette up``'s
+    # subprocess model — children re-read the config.
+    parser_plugins: list[str] = Field(default_factory=list)
     indexer: IndexerConfig = Field(default_factory=IndexerConfig)
 
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
