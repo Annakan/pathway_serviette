@@ -59,6 +59,20 @@ class AsyncVectorAccessor(ABC):
     async def close(self) -> None:
         """Release any underlying connections / pools."""
 
+    async def fetch_all(self, with_embeddings: bool = False) -> list[dict[str, Any]]:
+        """Every stored chunk as a hit dict (``text``/``metadata``, plus
+        ``embedding`` when ``with_embeddings``).
+
+        Interim listing API for non-search consumers (e.g. the rAIvisor
+        ``kb`` CLI) until a real filtered-fetch/query contract exists
+        (rAIvisor M99). Backends that cannot list cheaply leave the
+        default, which raises :class:`NotImplementedError`.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support fetch_all"
+        )
+
     async def stats(self) -> dict[str, Any]:
         """Lightweight backend statistics for observability.
 

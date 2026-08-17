@@ -67,6 +67,10 @@ class DuckDbAccessor(KeywordHybridMixin, AsyncVectorAccessor):
     async def _hybrid_fetch_all(self, with_embeddings: bool) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._fetch_all_rows, with_embeddings)
 
+    async def fetch_all(self, with_embeddings: bool = False) -> list[dict[str, Any]]:
+        """Public listing API (interim until a filtered-fetch contract exists)."""
+        return await self._hybrid_fetch_all(with_embeddings)
+
     # A writer flushing with detach_between_batches holds the lock only
     # briefly; ride out that window before declaring the file unreachable.
     _LOCK_RETRIES = 10
