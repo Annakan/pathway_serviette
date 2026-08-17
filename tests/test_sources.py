@@ -290,7 +290,7 @@ def test_parser_skip_produces_empty_text(monkeypatch, caplog):
     monkeypatch.delenv("TWELVELABS_API_KEY", raising=False)
     reg = _registry()
     assert reg.parse(b"\x00fakevideo", ".mp4", "demo.mp4") == []
-    assert any("Skipping" in r.message for r in caplog.records)
+    assert any("skip_file" in r.message for r in caplog.records)
 
 
 def test_parser_rule_with_missing_dep_fails_at_startup():

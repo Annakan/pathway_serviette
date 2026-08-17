@@ -134,7 +134,9 @@ def test_element_mapper_transforms_metadata():
 
 
 def test_element_mapper_none_drops_element():
-    """A mapper returning None drops the element (filtering)."""
+    """A mapper returning None does not claim the element; with no other
+    mapper registered the element is dropped WITH an ingestion-report
+    record (M2 D-M2-3 — no silent drops)."""
     from serviette.indexer.graph import ParserRegistry
     from serviette.indexer.parsers import register_parser, register_element_mapper
     from serviette.config.schema import ParserRule
@@ -152,6 +154,10 @@ def test_element_mapper_none_drops_element():
     elements = reg.parse(b"contents", ".fake", "doc.fake", "/path/doc.fake")
     assert len(elements) == 1
     assert elements[0][1]["start_s"] == 10.0
+    drops = [r for r in reg.ingestion_report() if r["action"] == "drop_chunk"]
+    assert len(drops) == 1
+    assert drops[0]["stage"] == "normalize"
+    assert "no element mapper claimed" in drops[0]["reason"]
 
 
 def test_element_mapper_raise_skips_file():
@@ -182,8 +188,209 @@ def test_skip_ledger_records_route_skips():
     reg.parse(b"\x00fake", ".mp4", "demo.mp4", "/path/demo.mp4")
     report = reg.ingestion_report()
     assert len(report) == 1
-    assert report[0]["name"] == "demo.mp4"
+    assert report[0]["file"] == "demo.mp4"
+    assert report[0]["stage"] == "route"
+    assert report[0]["action"] == "skip_file"
     assert "skip:" in report[0]["reason"]
+
+
+class _FakeEmptyText:
+    """Parser yielding one empty-text and one real element."""
+
+    takes_context = True
+    pre_chunked = True
+
+    def __init__(self, **options):
+        pass
+
+    def parse(self, contents: bytes, context: dict):
+        return [("", {"kind": "x"}), ("real text", {"kind": "x"})]
+
+
+class _FakeZeroChunks:
+    """Parser yielding nothing for a non-empty file."""
+
+    takes_context = True
+    pre_chunked = True
+
+    def __init__(self, **options):
+        pass
+
+    def parse(self, contents: bytes, context: dict):
+        return []
+
+
+class _FakeRecording:
+    """Parser emitting an ingestion-report record via context["record"]."""
+
+    takes_context = True
+    pre_chunked = True
+
+    def __init__(self, **options):
+        pass
+
+    def parse(self, contents: bytes, context: dict):
+        context["record"](
+            "group", "oversize_excerpt",
+            "no sentence boundary before alert threshold",
+            chunk_locator="120.0-300.0s",
+        )
+        return [("text", {"kind": "x"})]
+
+
+def test_drop_chunk_signal_keeps_file():
+    """DropChunk drops one element with a record; the file keeps indexing
+    (M2 D-M2-3 — skipping the whole file for one bad chunk is forbidden)."""
+    from serviette.indexer.graph import ParserRegistry
+    from serviette.indexer.parsers import (
+        DropChunk, register_element_mapper, register_parser,
+    )
+    from serviette.config.schema import ParserRule
+
+    register_parser("fake_pre", _FakePreChunked)
+
+    def dropper(text, meta, source_meta, parser_kind):
+        if meta.get("start_s") == 0.0:
+            raise DropChunk("schema validation failed: page ≥ 1 required",
+                            chunk_locator="0.0-10.0s")
+        return meta
+
+    register_element_mapper(dropper)
+    reg = ParserRegistry([ParserRule(match=["*.fake"], type="fake_pre")])
+    elements = reg.parse(b"contents", ".fake", "doc.fake", "/path/doc.fake")
+    assert len(elements) == 1
+    assert elements[0][1]["start_s"] == 10.0
+    report = reg.ingestion_report()
+    assert len(report) == 1
+    assert report[0]["action"] == "drop_chunk"
+    assert report[0]["stage"] == "validate"
+    assert report[0]["chunk_locator"] == "0.0-10.0s"
+    assert "page ≥ 1" in report[0]["reason"]
+
+
+def test_skip_file_signal_skips_with_reason():
+    """SkipFile skips the whole file with the mapper's reason verbatim."""
+    from serviette.indexer.graph import ParserRegistry
+    from serviette.indexer.parsers import (
+        SkipFile, register_element_mapper, register_parser,
+    )
+    from serviette.config.schema import ParserRule
+
+    register_parser("fake_pre", _FakePreChunked)
+
+    def rejector(text, meta, source_meta, parser_kind):
+        raise SkipFile("unsupported parser for KB: 'fake_pre'")
+
+    register_element_mapper(rejector)
+    reg = ParserRegistry([ParserRule(match=["*.fake"], type="fake_pre")])
+    assert reg.parse(b"contents", ".fake", "doc.fake", "/path/doc.fake") == []
+    report = reg.ingestion_report()
+    assert len(report) == 1
+    assert report[0]["action"] == "skip_file"
+    assert report[0]["stage"] == "normalize"
+    assert report[0]["reason"] == "unsupported parser for KB: 'fake_pre'"
+
+
+def test_empty_element_text_recorded():
+    """Empty-text elements are dropped WITH a record (was a silent drop)."""
+    from serviette.indexer.graph import ParserRegistry
+    from serviette.indexer.parsers import register_parser
+    from serviette.config.schema import ParserRule
+
+    register_parser("fake_empty", _FakeEmptyText)
+    reg = ParserRegistry([ParserRule(match=["*.fake"], type="fake_empty")])
+    elements = reg.parse(b"contents", ".fake", "doc.fake", "/path/doc.fake")
+    assert [t for t, _ in elements] == ["real text"]
+    report = reg.ingestion_report()
+    assert len(report) == 1
+    assert report[0]["action"] == "drop_chunk"
+    assert report[0]["stage"] == "parse"
+    assert report[0]["reason"] == "empty element text"
+
+
+def test_zero_chunks_red_flag():
+    """A non-empty file producing no chunks and no other record is a red
+    flag (M2 D-M2-4)."""
+    from serviette.indexer.graph import ParserRegistry
+    from serviette.indexer.parsers import register_parser
+    from serviette.config.schema import ParserRule
+
+    register_parser("fake_zero", _FakeZeroChunks)
+    reg = ParserRegistry([ParserRule(match=["*.fake"], type="fake_zero")])
+    assert reg.parse(b"contents", ".fake", "doc.fake", "/path/doc.fake") == []
+    report = reg.ingestion_report()
+    assert len(report) == 1
+    assert report[0]["action"] == "zero_chunks"
+    assert report[0]["stage"] == "parse"
+
+
+def test_parse_failure_does_not_double_record():
+    """A recorded parse failure must not also get a zero_chunks record."""
+    from serviette.indexer.graph import ParserRegistry
+    from serviette.indexer.parsers import register_parser
+    from serviette.config.schema import ParserRule
+
+    class _Boom:
+        takes_context = True
+
+        def __init__(self, **options):
+            pass
+
+        def parse(self, contents, context):
+            raise RuntimeError("corrupt file")
+
+    register_parser("fake_boom", _Boom)
+    reg = ParserRegistry([ParserRule(match=["*.fake"], type="fake_boom")])
+    assert reg.parse(b"contents", ".fake", "doc.fake", "/path/doc.fake") == []
+    report = reg.ingestion_report()
+    assert len(report) == 1
+    assert report[0]["action"] == "skip_file"
+    assert report[0]["stage"] == "parse"
+
+
+def test_context_record_callback():
+    """takes_context parsers emit records via context['record'] (M2:
+    oversize_excerpt from the vidprep transcript splitter)."""
+    from serviette.indexer.graph import ParserRegistry
+    from serviette.indexer.parsers import register_parser
+    from serviette.config.schema import ParserRule
+
+    register_parser("fake_rec", _FakeRecording)
+    reg = ParserRegistry([ParserRule(match=["*.fake"], type="fake_rec")])
+    elements = reg.parse(b"contents", ".fake", "doc.fake", "/path/doc.fake")
+    assert len(elements) == 1
+    report = reg.ingestion_report()
+    assert len(report) == 1
+    assert report[0]["stage"] == "group"
+    assert report[0]["action"] == "oversize_excerpt"
+    assert report[0]["parser"] == "fake_rec"
+    assert report[0]["chunk_locator"] == "120.0-300.0s"
+
+
+def test_report_writer_files(tmp_path):
+    """The on-disk report mirrors records: events.jsonl + summary.txt
+    with matching counts (M2 §Error recording)."""
+    from serviette.indexer.graph import (
+        ParserRegistry, _IngestionReportWriter,
+    )
+
+    reg = ParserRegistry()
+    reg.report_writer = _IngestionReportWriter(tmp_path)
+    reg.parse(b"\x00fake", ".mp4", "demo.mp4", "/path/demo.mp4")
+    reg.parse(b"\x00fake", ".mkv", "other.mkv", "/path/other.mkv")
+
+    run_dirs = list(tmp_path.glob("ingestion_*"))
+    assert len(run_dirs) == 1
+    events = (run_dirs[0] / "events.jsonl").read_text().strip().splitlines()
+    assert len(events) == 2
+    parsed = [json.loads(line) for line in events]
+    assert {r["file"] for r in parsed} == {"demo.mp4", "other.mkv"}
+    assert all(r["stage"] == "route" and r["action"] == "skip_file"
+               for r in parsed)
+    assert all("ts" in r for r in parsed)
+    summary = (run_dirs[0] / "summary.txt").read_text()
+    assert "route/skip_file: 2" in summary
+    assert "demo.mp4" in summary and "other.mkv" in summary
 
 
 def test_unknown_parser_type_rejected_at_startup():

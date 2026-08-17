@@ -38,6 +38,8 @@ import inspect
 import json
 import logging
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pathway as pw
@@ -73,6 +75,53 @@ def _json_to_dict(value: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+class _IngestionReportWriter:
+    """On-disk mirror of the ingestion report (M2 D-M2-3/§Error recording).
+
+    One directory per indexer run — ``<log_dir>/ingestion_<YYYYMMDD-HHMMSS>/``
+    — holding ``events.jsonl`` (one record per line, flushed per append so a
+    crash keeps records) and ``summary.txt`` (human-readable counts by class
+    + per-file reasons, rewritten on each record; volume is bounded by the
+    number of bad files). In streaming mode both keep appending for the
+    process's lifetime.
+    """
+
+    def __init__(self, log_dir: Path) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        self.run_dir = log_dir / f"ingestion_{stamp}"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._events_path = self.run_dir / "events.jsonl"
+        self._summary_path = self.run_dir / "summary.txt"
+        self._records: list[dict[str, Any]] = []
+
+    def record(self, rec: dict[str, Any]) -> None:
+        self._records.append(rec)
+        with self._events_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._rewrite_summary()
+
+    def _rewrite_summary(self) -> None:
+        counts: dict[str, int] = {}
+        for rec in self._records:
+            key = f"{rec['stage']}/{rec['action']}"
+            counts[key] = counts.get(key, 0) + 1
+        lines = [
+            f"Ingestion report — {len(self._records)} record(s)",
+            "",
+            "Counts by class:",
+            *(f"  {k}: {v}" for k, v in sorted(counts.items())),
+            "",
+            "Records:",
+            *(
+                f"  [{r['ts']}] {r['stage']}/{r['action']} {r['file']}"
+                + (f" ({r['chunk_locator']})" if r.get("chunk_locator") else "")
+                + f" — {r['reason']}"
+                for r in self._records
+            ),
+        ]
+        self._summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 class ParserRegistry:
     """Rule-based, extension-dispatched xpack parsers.
 
@@ -102,12 +151,14 @@ class ParserRegistry:
         self._rules = list(rules or [])
         self._instances: dict[Any, Any] = {}
         self._defaults: dict[str, tuple[str, dict]] = {}
-        self._warned: set[str] = set()
         # Ingestion report: every file that never reaches the vector store
-        # (route-skip, fetch error, parse failure, normalization failure) —
-        # the in-memory record list behind ``ingestion_report()`` (M2).
-        # Deduped warnings stay as-is.
-        self._ingestion_records: list[dict[str, str]] = []
+        # and every dropped chunk (route-skip, fetch error, parse failure,
+        # normalization failure, chunk drops, zero-chunk red flags) — the
+        # in-memory record list behind ``ingestion_report()`` (M2). Every
+        # record also logs a per-file WARNING and is mirrored to the
+        # on-disk report when a writer is attached (build_graph).
+        self._ingestion_records: list[dict[str, Any]] = []
+        self.report_writer: _IngestionReportWriter | None = None
 
     # -- keyless-first defaults ------------------------------------------------
 
@@ -289,7 +340,11 @@ class ParserRegistry:
         kind, options = self._route(suffix, name, path)
         if kind == "skip":
             reason = options.get("reason", "no parser configured")
-            self._record_event(name or path or suffix, path, f"skip: {reason}")
+            self._record_event(
+                file=name or path or suffix, path=path,
+                stage="route", action="skip_file",
+                reason=f"skip: {reason}",
+            )
             return []
         options.pop("reason", None)
         try:
@@ -300,10 +355,32 @@ class ParserRegistry:
             # imports inside the xpack parsers themselves. One file must
             # never kill the pipeline.
             self._record_event(
-                name or path or suffix, path, f"parser {kind!r} unavailable: {exc}"
+                file=name or path or suffix, path=path,
+                stage="route", action="skip_file",
+                reason=f"parser {kind!r} unavailable: {exc}", parser=kind,
             )
             return []
-        context = {"path": path, "name": name, "metadata": {}}
+        records_before = len(self._ingestion_records)
+
+        def record_from_parser(
+            stage: str,
+            action: str,
+            reason: str,
+            chunk_locator: str | None = None,
+        ) -> None:
+            """``context["record"]`` for takes_context parsers (M2): emit
+            ingestion-report records from inside element generation (e.g.
+            ``group/oversize_excerpt`` from the vidprep transcript
+            splitter)."""
+
+            self._record_event(
+                file=name or path or suffix, path=path,
+                stage=stage, action=action, reason=reason,
+                parser=kind, chunk_locator=chunk_locator,
+            )
+
+        context = {"path": path, "name": name, "metadata": {},
+                   "record": record_from_parser}
         try:
             # Registered parsers may define parse(contents, context) with
             # takes_context=True (vidprep_bundle needs the path to find
@@ -317,11 +394,27 @@ class ParserRegistry:
                     result = asyncio.run(result)  # type: ignore[arg-type]
         except Exception as exc:  # noqa: BLE001 - one bad file must never kill the pipeline
             self._record_event(
-                name or path or suffix, path,
-                f"parse failure ({kind!r}): {exc}",
+                file=name or path or suffix, path=path,
+                stage="parse", action="skip_file",
+                reason=f"parse failure ({kind!r}): {exc}", parser=kind,
             )
             return []
-        return self._normalize_elements(result, kind, name, path, suffix)
+        elements = self._normalize_elements(result, kind, name, path, suffix)
+        if (
+            not elements
+            and records_before == len(self._ingestion_records)
+            and contents.strip()
+        ):
+            # Zero-chunk red flag (M2 D-M2-4): a successfully fetched,
+            # non-empty file produced no chunks and said nothing — that's
+            # always worth a record. Files that already recorded a
+            # skip/drop don't double-record.
+            self._record_event(
+                file=name or path or suffix, path=path,
+                stage="parse", action="zero_chunks",
+                reason="non-empty file produced no chunks", parser=kind,
+            )
+        return elements
 
     def _normalize_elements(
         self,
@@ -332,9 +425,16 @@ class ParserRegistry:
         suffix: str,
     ) -> list[tuple[str, dict]]:
         """Coerce element texts and apply the element-mapper chain (KB
-        normalization + validation). A mapper raising fails the *file*
-        (recorded + skipped, never reaching the store); ``None`` drops the
-        element. Without mappers, native per-element metadata rides through."""
+        normalization + validation).
+
+        Mapper protocol (M2 D-M2-3 — no silent drops): a mapper returns a
+        mapped dict (claimed), returns ``None`` (pass to the next mapper),
+        raises ``SkipFile`` (file-level problem → one ``skip_file`` record,
+        file skipped) or ``DropChunk`` (chunk-level problem → one
+        ``drop_chunk`` record, file keeps indexing). With mappers
+        registered, an element no mapper claims is dropped WITH a record —
+        the KB path must never leak native keys vanilla-style. Without
+        mappers, native per-element metadata rides through unchanged."""
 
         mappers = _parser_plugins.element_mappers()
         source_meta = {"name": name, "path": path}
@@ -342,6 +442,11 @@ class ParserRegistry:
         for text, meta in result:
             text = str(text) if text else ""
             if not text:
+                self._record_event(
+                    file=name or path or suffix, path=path,
+                    stage="parse", action="drop_chunk",
+                    reason="empty element text", parser=kind,
+                )
                 continue
             meta = dict(meta) if meta else {}
             if mappers:
@@ -351,13 +456,36 @@ class ParserRegistry:
                         mapped = mapper(text, meta, source_meta, kind)
                         if mapped is not None:
                             break
-                except Exception as exc:  # noqa: BLE001 - normalization failure = file skip
+                except _parser_plugins.SkipFile as exc:
                     self._record_event(
-                        name or path or suffix, path,
-                        f"metadata normalization failure ({kind!r}): {exc}",
+                        file=name or path or suffix, path=path,
+                        stage="normalize", action="skip_file",
+                        reason=exc.reason, parser=kind,
+                    )
+                    return []
+                except _parser_plugins.DropChunk as exc:
+                    self._record_event(
+                        file=name or path or suffix, path=path,
+                        stage=exc.stage, action="drop_chunk",
+                        reason=exc.reason, parser=kind,
+                        chunk_locator=exc.chunk_locator,
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001 - defensive: a mapper bug must not kill the pipeline
+                    self._record_event(
+                        file=name or path or suffix, path=path,
+                        stage="normalize", action="skip_file",
+                        reason=f"metadata normalization failure ({kind!r}): {exc}",
+                        parser=kind,
                     )
                     return []
                 if mapped is None:
+                    self._record_event(
+                        file=name or path or suffix, path=path,
+                        stage="normalize", action="drop_chunk",
+                        reason=f"no element mapper claimed this element ({kind!r})",
+                        parser=kind,
+                    )
                     continue
                 meta = mapped
             elements.append((text, meta))
@@ -376,16 +504,51 @@ class ParserRegistry:
             return False
         return bool(getattr(parser, "pre_chunked", False))
 
-    def _record_event(self, name: str, path: str, reason: str) -> None:
-        """Log once per unique reason; always append to the ingestion report."""
+    def _record_event(
+        self,
+        *,
+        file: str,
+        path: str,
+        stage: str,
+        action: str,
+        reason: str,
+        parser: str | None = None,
+        chunk_locator: str | None = None,
+    ) -> None:
+        """Append one ingestion-report record, log a per-file WARNING, and
+        mirror to the on-disk report when a writer is attached.
 
-        if reason not in self._warned:
-            self._warned.add(reason)
-            logger.warning("Skipping %r — %s", name, reason)
-        self._ingestion_records.append({"name": name, "path": path, "reason": reason})
+        ``stage`` ∈ route/fetch/parse/normalize/validate/group;
+        ``action`` ∈ skip_file/drop_chunk/zero_chunks/oversize_excerpt
+        (M2 spec §Error recording). Warnings are intentionally NOT deduped:
+        every record names its file — volume is bounded by the number of
+        bad files, which is exactly what the user must see.
+        """
 
-    def ingestion_report(self) -> list[dict[str, str]]:
-        """Every file that never reached the vector store (M2 report)."""
+        rec: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "file": file,
+            "path": path,
+            "stage": stage,
+            "action": action,
+            "reason": reason,
+        }
+        if parser is not None:
+            rec["parser"] = parser
+        if chunk_locator is not None:
+            rec["chunk_locator"] = chunk_locator
+        self._ingestion_records.append(rec)
+        logger.warning(
+            "Ingestion %s/%s %r%s — %s",
+            stage, action, file,
+            f" ({chunk_locator})" if chunk_locator else "",
+            reason,
+        )
+        if self.report_writer is not None:
+            self.report_writer.record(rec)
+
+    def ingestion_report(self) -> list[dict[str, Any]]:
+        """Every skip/drop record of this run (M2 report; M3 consumes it)."""
 
         return list(self._ingestion_records)
 
@@ -512,6 +675,9 @@ def build_graph(
 
     registry = ParserRegistry(config.parser)
     registry.check_rule_deps()
+    registry.report_writer = _IngestionReportWriter(
+        Path(config.indexer.ingestion_log_dir)
+    )
     splitter = splitter if splitter is not None else build_xpack_splitter(config.splitter)
     embedder = embedder if embedder is not None else build_xpack_embedder(config.embedder)
 
@@ -533,8 +699,10 @@ def build_graph(
             except Exception as exc:  # noqa: BLE001 - object may have vanished / be unreadable
                 logger.warning("Could not fetch source object %s: %s", meta, exc)
                 registry._record_event(
-                    str(meta.get("name", "")), str(meta.get("path", "")),
-                    f"fetch failure: {exc}",
+                    file=str(meta.get("name", "")),
+                    path=str(meta.get("path", "")),
+                    stage="fetch", action="skip_file",
+                    reason=f"fetch failure: {exc}",
                 )
                 return []
             return registry.parse(

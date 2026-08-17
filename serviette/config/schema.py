@@ -540,6 +540,12 @@ class IndexerConfig(BaseModel):
     # instead of RAM (requires a Pathway build with pw.run's
     # udf_cache_directory). Point it at a real disk, not tmpfs.
     udf_cache_directory: str | None = None
+    # Directory for the per-run ingestion report (M2): each indexer run
+    # creates ``<dir>/ingestion_<YYYYMMDD-HHMMSS>/`` with ``events.jsonl``
+    # (machine, M3's input) and ``summary.txt`` (human). Relative paths
+    # resolve against the process working directory (the config file's
+    # directory in practice).
+    ingestion_log_dir: str = "./log"
     # Advanced. First port of the inter-worker communication range used by
     # ``pathway spawn`` when workers > 1 (each worker binds first_port + index).
     # Shift it when several Pathway applications share a host — the default

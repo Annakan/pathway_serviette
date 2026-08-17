@@ -44,9 +44,45 @@ logger = logging.getLogger(__name__)
 _PARSER_CLASSES: dict[str, type] = {}
 
 # Element mappers applied, in registration order, to every parsed element.
-# The first mapper to return a dict wins; None drops the element. In practice
-# exactly one mapper is registered (the KB normalization layer).
+# The first mapper to return a dict wins; None passes to the next mapper.
+# DropChunk/SkipFile below carry the drop/skip reason into the ingestion
+# report — the silent-None drop is banned (M2 D-M2-3). In practice exactly
+# one mapper is registered (the KB normalization layer).
 _ELEMENT_MAPPERS: list[Callable[[str, dict, dict, str], dict | None]] = []
+
+
+class SkipFile(Exception):
+    """Mapper signal: skip the whole file, record the reason.
+
+    Raised for file-level problems (fetch/route/parse failures are handled
+    pipeline-side; mappers raise this for unsupported parser output,
+    unknown source kind, path outside corpus roots, missing session dir).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class DropChunk(Exception):
+    """Mapper signal: drop this element, record the reason; the file keeps
+    indexing (M2 D-M2-3 — skipping a whole file for one bad chunk is
+    forbidden). ``stage`` defaults to ``validate`` (schema validation is
+    the common case); ``chunk_locator`` identifies the dropped chunk
+    (page/slide number, timecode window) when known.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        stage: str = "validate",
+        chunk_locator: str | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.stage = stage
+        self.chunk_locator = chunk_locator
 
 # Modules already imported by load_plugins, so a second build_graph call in
 # the same process (tests, re-runs) does not re-invoke register() and stack
