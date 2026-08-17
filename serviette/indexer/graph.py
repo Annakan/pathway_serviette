@@ -289,6 +289,13 @@ class ParserRegistry:
                 return modality
         return "office"
 
+    def route(self, suffix: str, name: str, path: str = "") -> tuple[str, dict, bool]:
+        """Public routing query (read-only tooling, e.g. the rAIvisor ``kb
+        orphans`` command, resolves expected-skips with exactly the
+        indexer's semantics)."""
+
+        return self._route(suffix, name, path)
+
     def _route(self, suffix: str, name: str, path: str = "") -> tuple[str, dict, bool]:
         """Resolve (kind, options, matched_rule). ``matched_rule`` is True
         when a config rule (not the environment default) resolved the file —
