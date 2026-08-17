@@ -116,7 +116,7 @@ class PgVectorAccessor(KeywordHybridMixin, AsyncVectorAccessor):
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"SELECT count(*) AS chunks,"
-                f"  count(DISTINCT metadata->>'path') AS documents,"
+                f"  count(DISTINCT coalesce(metadata->>'path', metadata->>'source_file')) AS documents,"
                 f"  max((metadata->>'seen_at')::bigint) AS last_indexed_at "
                 f"FROM {self._table}"
             )
