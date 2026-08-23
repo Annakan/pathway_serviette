@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import yaml
 
-from serviette.config.schema import ServietteConfig, load_config_dict
+from serviette.config.schema import ServietteConfig, load_config, load_config_dict
 from serviette.quickstart.wizard import ScriptedPrompter, Wizard, build_config, dump_yaml
 
 BASE = {
@@ -223,3 +225,11 @@ def test_wizard_duckdb_happy_path_is_minimal(tmp_path, monkeypatch):
     assert cfg.vector_db.type == "duckdb"
     assert cfg.vector_db.path == "./embeddings.duckdb"
     assert cfg.embedder.type == "sentence_transformer"
+
+    # The written relative path is interpreted relative to the config file's
+    # directory once the wizard output is loaded from disk (anchoring).
+    cfg_dir = tmp_path / "cfgdir"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.yaml").write_text(dump_yaml(build_config(answers)))
+    loaded = load_config(cfg_dir / "config.yaml")
+    assert Path(loaded.vector_db.path) == cfg_dir / "embeddings.duckdb"

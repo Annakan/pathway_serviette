@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Annotated, Any, Literal
 
 import yaml
@@ -543,8 +543,8 @@ class IndexerConfig(BaseModel):
     # Directory for the per-run ingestion report (M2): each indexer run
     # creates ``<dir>/ingestion_<YYYYMMDD-HHMMSS>/`` with ``events.jsonl``
     # (machine, M3's input) and ``summary.txt`` (human). Relative paths
-    # resolve against the process working directory (the config file's
-    # directory in practice).
+    # resolve against the config file's directory (see :func:`load_config`);
+    # dict-validated configs keep them verbatim.
     ingestion_log_dir: str = "./log"
     # Advanced. First port of the inter-worker communication range used by
     # ``pathway spawn`` when workers > 1 (each worker binds first_port + index).
@@ -572,7 +572,8 @@ class PersistenceConfig(BaseModel):
 
     enabled: bool = True
     backend: Literal["filesystem"] = "filesystem"
-    # Relative to the indexer's working directory; writable out of the box.
+    # Relative to the config file's directory (see :func:`load_config`);
+    # writable out of the box.
     path: str = "./persistence"
 
 
@@ -704,20 +705,76 @@ def interpolate_env(value: Any) -> Any:
     return value
 
 
+def _anchor_paths(data: dict[str, Any], base: Path) -> dict[str, Any]:
+    """Rebase relative filesystem paths in ``data`` against ``base``.
+
+    The filesystem path fields (DuckDB store file, persistence directory,
+    ingestion log directory, ``fs`` source paths) are rewritten to absolute
+    paths under ``base`` — the config file's directory — when relative, so a
+    config means the same thing from any working directory. Absolute paths
+    pass through untouched, as do URL-ish values (containing ``://``);
+    ``~``-prefixed values expand to the home directory and are likewise not
+    rebased (explicit user intent). Non-filesystem backends (qdrant & co),
+    non-``fs`` sources and disabled persistence are left alone.
+    """
+
+    def rebase(value: str) -> str:
+        if "://" in value:
+            return value
+        expanded = os.path.expanduser(value)
+        if PurePath(expanded).is_absolute():
+            return expanded
+        return str((base / value).resolve())
+
+    def rebase_key(section: Any, key: str) -> None:
+        if isinstance(section, dict) and isinstance(section.get(key), str):
+            section[key] = rebase(section[key])
+
+    vector_db = data.get("vector_db")
+    if isinstance(vector_db, dict) and vector_db.get("type") == "duckdb":
+        rebase_key(vector_db, "path")
+
+    persistence = data.get("persistence")
+    if isinstance(persistence, dict) and persistence.get("enabled", True):
+        rebase_key(persistence, "path")
+
+    indexer = data.get("indexer")
+    if isinstance(indexer, dict):
+        rebase_key(indexer, "ingestion_log_dir")
+
+    sources = data.get("sources")
+    if isinstance(sources, list):
+        for source in sources:
+            if isinstance(source, dict) and source.get("type", "fs") == "fs":
+                rebase_key(source, "path")
+
+    return data
+
+
 def load_config(path: str | Path) -> ServietteConfig:
-    """Load, env-interpolate and validate a YAML config file."""
+    """Load, env-interpolate and validate a YAML config file.
+
+    Relative filesystem paths resolve against the config file's directory
+    (see :func:`_anchor_paths`), so a config is portable across working
+    directories; :func:`load_config_dict` keeps values verbatim.
+    """
 
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise TypeError(f"Config root must be a mapping, got {type(raw).__name__}")
     interpolated = interpolate_env(raw)
+    anchored = _anchor_paths(interpolated, Path(path).parent)
     try:
-        return ServietteConfig.model_validate(interpolated)
+        return ServietteConfig.model_validate(anchored)
     except ValidationError as exc:  # pragma: no cover - re-raised with context
         raise ValueError(f"Invalid configuration in {path}:\n{exc}") from exc
 
 
 def load_config_dict(data: dict[str, Any]) -> ServietteConfig:
-    """Validate an already-parsed config dict (used by the quickstart wizard)."""
+    """Validate an already-parsed config dict (used by the quickstart wizard).
+
+    Dict-validated configs keep relative paths verbatim (cwd resolution):
+    the config-file anchoring is a :func:`load_config` behavior only.
+    """
 
     return ServietteConfig.model_validate(interpolate_env(data))
