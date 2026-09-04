@@ -22,11 +22,9 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class AsyncEmbedder(Protocol):
-    async def embed(self, text: str) -> list[float]:
-        ...
+    async def embed(self, text: str) -> list[float]: ...
 
-    async def close(self) -> None:
-        ...
+    async def close(self) -> None: ...
 
 
 class MockAsyncEmbedder:
@@ -54,7 +52,17 @@ class OpenAIAsyncEmbedder:
         self._model = config.model or "text-embedding-3-small"
         self._api_key = config.api_key
         # Forward any extra keys (e.g. base_url) declared on the config.
-        extra = config.model_dump(exclude={"type", "model", "api_key", "query_prefix", "document_prefix", "capacity", "retries"})
+        extra = config.model_dump(
+            exclude={
+                "type",
+                "model",
+                "api_key",
+                "query_prefix",
+                "document_prefix",
+                "capacity",
+                "retries",
+            }
+        )
         self._client_kwargs = {k: v for k, v in extra.items() if v is not None}
         self._client = None
 
@@ -74,6 +82,47 @@ class OpenAIAsyncEmbedder:
         if self._client is not None:
             await self._client.close()
             self._client = None
+
+
+class LiteLLMAsyncEmbedder:
+    """Embed queries through LiteLLM, matching the indexer's provider route.
+
+    Unlike the OpenAI-compatible client, LiteLLM needs the provider-qualified
+    model name (for example ``openrouter/qwen/qwen3-embedding-0.6b``) and owns
+    request parameters such as ``api_base`` and ``dimensions``.
+    """
+
+    def __init__(self, config) -> None:
+        self._model = config.model
+        if not self._model:
+            raise ValueError("litellm embedder requires a provider-qualified model")
+        self._api_key = config.api_key
+        extra = config.model_dump(
+            exclude={
+                "type",
+                "model",
+                "api_key",
+                "query_prefix",
+                "document_prefix",
+                "capacity",
+                "retries",
+            }
+        )
+        self._call_kwargs = {key: value for key, value in extra.items() if value is not None}
+
+    async def embed(self, text: str) -> list[float]:
+        import litellm
+
+        response = await litellm.aembedding(
+            model=self._model,
+            api_key=self._api_key,
+            input=[text],
+            **self._call_kwargs,
+        )
+        return [float(value) for value in response.data[0]["embedding"]]
+
+    async def close(self) -> None:
+        return None
 
 
 class SentenceTransformerAsyncEmbedder:
@@ -96,7 +145,18 @@ class SentenceTransformerAsyncEmbedder:
         # Forward extra config keys (device, truncate_dim, ...) to the
         # SentenceTransformer constructor — mirrors the indexer's xpack
         # embedder, so e.g. Matryoshka truncation stays consistent.
-        extra = config.model_dump(exclude={"type", "model", "api_key", "batch_size", "query_prefix", "document_prefix", "capacity", "retries"})
+        extra = config.model_dump(
+            exclude={
+                "type",
+                "model",
+                "api_key",
+                "batch_size",
+                "query_prefix",
+                "document_prefix",
+                "capacity",
+                "retries",
+            }
+        )
         self._model_kwargs = {k: v for k, v in extra.items() if v is not None}
         self._model_kwargs.setdefault("device", "cpu")
         self._model = None
@@ -144,9 +204,7 @@ class GeminiAsyncEmbedder:
         import asyncio
 
         genai = self._ensure_configured()
-        response = await asyncio.to_thread(
-            genai.embed_content, model=self._model, content=text
-        )
+        response = await asyncio.to_thread(genai.embed_content, model=self._model, content=text)
         return [float(x) for x in response["embedding"]]
 
     async def close(self) -> None:
@@ -164,7 +222,17 @@ class BedrockAsyncEmbedder:
     _DEFAULT_MODEL = "amazon.titan-embed-text-v2:0"
 
     def __init__(self, config) -> None:
-        extra = config.model_dump(exclude={"type", "model", "api_key", "query_prefix", "document_prefix", "capacity", "retries"})
+        extra = config.model_dump(
+            exclude={
+                "type",
+                "model",
+                "api_key",
+                "query_prefix",
+                "document_prefix",
+                "capacity",
+                "retries",
+            }
+        )
         self._model_id = extra.pop("model_id", None) or config.model or self._DEFAULT_MODEL
         self._client_kwargs = {k: v for k, v in extra.items() if v is not None}
         self._client = None
@@ -194,12 +262,7 @@ class BedrockAsyncEmbedder:
         self._client = None
 
 
-# Embedder families that map onto an OpenAI-compatible async client.
-_OPENAI_COMPATIBLE = {"openai", "litellm"}
-
-_SUPPORTED = sorted(
-    _OPENAI_COMPATIBLE | {"sentence_transformer", "gemini", "bedrock", "mock"}
-)
+_SUPPORTED = sorted({"openai", "litellm", "sentence_transformer", "gemini", "bedrock", "mock"})
 
 
 def build_embedder(config) -> AsyncEmbedder:
@@ -212,8 +275,10 @@ def build_embedder(config) -> AsyncEmbedder:
 
     if config.type == "mock":
         return MockAsyncEmbedder()
-    if config.type in _OPENAI_COMPATIBLE:
+    if config.type == "openai":
         return OpenAIAsyncEmbedder(config)
+    if config.type == "litellm":
+        return LiteLLMAsyncEmbedder(config)
     if config.type in {"sentence_transformer", "sentencetransformer"}:
         return SentenceTransformerAsyncEmbedder(config)
     if config.type == "gemini":

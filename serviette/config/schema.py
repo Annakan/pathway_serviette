@@ -173,6 +173,10 @@ class ParserRule(BaseModel):
         )
     )
     options: dict[str, Any] = Field(default_factory=dict)
+    # Keep this rule unless every named environment variable equals the
+    # configured value after whitespace trimming. This supports declarative,
+    # fingerprint-visible opt-in gates without moving policy into parsers.
+    unless_env: dict[str, str] = Field(default_factory=dict)
 
 
 Source = Annotated[
@@ -354,7 +358,14 @@ class MongoDbConfig(_HybridCapableConfig):
 
 
 VectorDBConfig = Annotated[
-    DuckDbConfig | PgVectorConfig | MilvusConfig | QdrantConfig | ChromaConfig | WeaviateConfig | PineconeConfig | MongoDbConfig,
+    DuckDbConfig
+    | PgVectorConfig
+    | MilvusConfig
+    | QdrantConfig
+    | ChromaConfig
+    | WeaviateConfig
+    | PineconeConfig
+    | MongoDbConfig,
     Field(discriminator="type"),
 ]
 
@@ -658,14 +669,29 @@ class ServietteConfig(BaseModel):
     rag: RagConfig | None = None
     frontend: FrontendConfig | None = None
 
+    @model_validator(mode="after")
+    def _resolve_conditional_parser_rules(self) -> ServietteConfig:
+        """Remove rules disabled by their declarative environment condition."""
+
+        if self.parser is not None:
+            self.parser = [
+                rule
+                for rule in self.parser
+                if not rule.unless_env
+                or not all(
+                    (os.environ.get(name) or "").strip() == expected
+                    for name, expected in rule.unless_env.items()
+                )
+            ]
+        return self
+
     # -- per-component requirements -------------------------------------------
 
     def require(self, *fields: str) -> None:
         missing = [f for f in fields if not getattr(self, f)]
         if missing:
             raise ValueError(
-                "Missing required config section(s) for this command: "
-                + ", ".join(missing)
+                "Missing required config section(s) for this command: " + ", ".join(missing)
             )
 
     def for_indexer(self) -> ServietteConfig:

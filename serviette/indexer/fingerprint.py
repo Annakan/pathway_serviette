@@ -9,19 +9,23 @@ deletion time, its old chunk ids would not match, and the vector DB would
 keep orphaned rows.
 
 To catch that, the indexer stores the full risk-relevant objects (not just a
-hash) in ``<persistence dir>/serviette-fingerprint.json``:
+hash) in a JSON file **beside** the Pathway persistence directory. Keeping the
+file outside Pathway's directory is required: the engine interprets every root
+entry as its own persistence key and logs an error for arbitrary files. The
+fingerprint contains:
 
 - the splitter config,
-- the embedder identity (type / model / truncate_dim — never credentials),
-- versions of the libraries whose behavior shapes the outputs
-  (pathway, tiktoken, langchain_text_splitters).
+- the complete embedding-space identity (never credentials or runtime tuning),
+- parser routing,
+- versions of the libraries whose behavior shapes the outputs.
 
 On startup with persistence enabled the stored objects are compared with the
 current ones. Any difference is reported as an explicit diff with a
 human-readable explanation of the risk, and the indexer refuses to start
 unless the user confirms — interactively on a TTY, or via
 ``SERVIETTE_ACCEPT_FINGERPRINT_CHANGES=1`` in non-interactive deployments.
-Confirmation updates the stored fingerprint.
+Confirmation updates the stored fingerprint. Legacy files inside a persistence
+directory are moved to the sibling location before Pathway starts.
 """
 
 from __future__ import annotations
@@ -38,6 +42,12 @@ from serviette.config.schema import ServietteConfig
 logger = logging.getLogger(__name__)
 
 _FILENAME = "serviette-fingerprint.json"
+
+
+def _fingerprint_path(directory: Path) -> Path:
+    return directory.parent / f"{directory.name}.{_FILENAME}"
+
+
 _ACCEPT_ENV = "SERVIETTE_ACCEPT_FINGERPRINT_CHANGES"
 
 _RISKS = {
@@ -84,18 +94,27 @@ def _library_version(module: str) -> str | None:
 
 def build_fingerprint(config: ServietteConfig) -> dict[str, Any]:
     embedder = config.embedder.model_dump() if config.embedder else {}
+    runtime_embedder_keys = {
+        "api_key",
+        "device",
+        "batch_size",
+        "capacity",
+        "retries",
+        "timeout",
+    }
+    embedder_identity = {
+        key: value for key, value in embedder.items() if key not in runtime_embedder_keys
+    }
     from serviette.indexer.graph import ParserRegistry
 
     return {
         "splitter": config.splitter.model_dump(),
         "parser_plugins": list(config.parser_plugins),
         "parser": ParserRegistry(config.parser).resolved_rules(),
-        "embedder": {
-            # Identity only — never credentials.
-            "type": embedder.get("type"),
-            "model": embedder.get("model"),
-            "truncate_dim": embedder.get("truncate_dim"),
-        },
+        # Complete vector-space identity, never credentials or execution
+        # tuning. Revision, dimensions, prefixes, and model kwargs can change
+        # stored vectors and therefore must force an explicit re-index choice.
+        "embedder": embedder_identity,
         "libraries": {
             name: _library_version(name)
             for name in ("pathway", "tiktoken", "langchain_text_splitters")
@@ -117,9 +136,7 @@ def _diff(stored: dict[str, Any], current: dict[str, Any]) -> list[str]:
 
 def _confirm(diff_lines: list[str]) -> bool:
     if os.environ.get(_ACCEPT_ENV) == "1":
-        logger.warning(
-            "Fingerprint changes accepted via %s=1; proceeding.", _ACCEPT_ENV
-        )
+        logger.warning("Fingerprint changes accepted via %s=1; proceeding.", _ACCEPT_ENV)
         return True
     if sys.stdin.isatty():
         answer = input(
@@ -137,7 +154,10 @@ def check_fingerprint(config: ServietteConfig) -> None:
         return  # no persisted state to be inconsistent with
     directory = Path(config.persistence.path)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / _FILENAME
+    path = _fingerprint_path(directory)
+    legacy_path = directory / _FILENAME
+    if not path.exists() and legacy_path.exists():
+        legacy_path.replace(path)
 
     current = build_fingerprint(config)
     if not path.exists():

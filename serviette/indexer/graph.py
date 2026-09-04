@@ -42,11 +42,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar
 
+import numpy as np
 import pathway as pw
 
 from serviette.config.schema import ServietteConfig
-from serviette.indexer.sources import Fetcher, make_fetcher, read_source
 from serviette.indexer import parsers as _parser_plugins
+from serviette.indexer.sources import Fetcher, make_fetcher, read_source
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +199,10 @@ class ParserRegistry:
                 if self._importable("paddleocr"):
                     kind = ("paddle_ocr", {})
                 else:
-                    kind = ("skip", {"reason": "images: install serviette[ocr] or configure vision_image"})
+                    kind = (
+                        "skip",
+                        {"reason": "images: install serviette[ocr] or configure vision_image"},
+                    )
             elif modality == "audio":
                 if os.environ.get("OPENAI_API_KEY"):
                     kind = ("whisper", {})
@@ -231,10 +235,19 @@ class ParserRegistry:
     # ``check_rule_deps`` to reject unknown names — including registered
     # extension parsers — at startup. Kept as a static set so validation
     # does not import pathway.
-    _BUILTIN_KINDS: ClassVar[frozenset[str]] = frozenset({
-        "utf8", "pypdf", "docling", "unstructured", "paddle_ocr",
-        "vision_image", "vision_slide", "whisper", "twelvelabs_video",
-    })
+    _BUILTIN_KINDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "utf8",
+            "pypdf",
+            "docling",
+            "unstructured",
+            "paddle_ocr",
+            "vision_image",
+            "vision_slide",
+            "whisper",
+            "twelvelabs_video",
+        }
+    )
 
     def check_rule_deps(self) -> None:
         """Validate that every explicit rule's parser can actually be built."""
@@ -253,11 +266,13 @@ class ParserRegistry:
                 continue
             if rule.type in _parser_plugins.registered_parsers():
                 continue
-            known = sorted({
-                *self._BUILTIN_KINDS,
-                *_parser_plugins.registered_parsers(),
-                "skip",
-            })
+            known = sorted(
+                {
+                    *self._BUILTIN_KINDS,
+                    *_parser_plugins.registered_parsers(),
+                    "skip",
+                }
+            )
             raise ValueError(
                 f"parser rule {rule.match} -> {rule.type!r} is unknown. "
                 f"Known types: {', '.join(known)}"
@@ -307,9 +322,7 @@ class ParserRegistry:
         # keep matching. ``name or path`` so path-only connectors still route.
         candidates = [c for c in (name, path) if c] or [f"x{suffix}"]
         for rule in self._rules:
-            if any(
-                fnmatch.fnmatch(c, pat) for c in candidates for pat in rule.match
-            ):
+            if any(fnmatch.fnmatch(c, pat) for c in candidates for pat in rule.match):
                 return rule.type, dict(rule.options), True
         return *self._default_for(self._modality_for(suffix)), False
 
@@ -341,9 +354,7 @@ class ParserRegistry:
         if kind in registered:
             return registered[kind]
         known = sorted({*builtin, *registered, "skip"})
-        raise KeyError(
-            f"Unknown parser type {kind!r}. Known: {', '.join(known)}"
-        )
+        raise KeyError(f"Unknown parser type {kind!r}. Known: {', '.join(known)}")
 
     def parse(
         self, contents: bytes, suffix: str, name: str = "", path: str = ""
@@ -355,8 +366,10 @@ class ParserRegistry:
         if kind == "skip":
             reason = options.get("reason", "no parser configured")
             self._record_event(
-                file=name or path or suffix, path=path,
-                stage="route", action="skip_file",
+                file=name or path or suffix,
+                path=path,
+                stage="route",
+                action="skip_file",
                 reason=f"skip: {reason}",
                 # A config skip RULE is a deliberate exclusion (video
                 # upstream, bundle internal, corpus exclusions) — the
@@ -375,9 +388,12 @@ class ParserRegistry:
             # imports inside the xpack parsers themselves. One file must
             # never kill the pipeline.
             self._record_event(
-                file=name or path or suffix, path=path,
-                stage="route", action="skip_file",
-                reason=f"parser {kind!r} unavailable: {exc}", parser=kind,
+                file=name or path or suffix,
+                path=path,
+                stage="route",
+                action="skip_file",
+                reason=f"parser {kind!r} unavailable: {exc}",
+                parser=kind,
             )
             return []
         records_before = len(self._ingestion_records)
@@ -394,13 +410,16 @@ class ParserRegistry:
             splitter)."""
 
             self._record_event(
-                file=name or path or suffix, path=path,
-                stage=stage, action=action, reason=reason,
-                parser=kind, chunk_locator=chunk_locator,
+                file=name or path or suffix,
+                path=path,
+                stage=stage,
+                action=action,
+                reason=reason,
+                parser=kind,
+                chunk_locator=chunk_locator,
             )
 
-        context = {"path": path, "name": name, "metadata": {},
-                   "record": record_from_parser}
+        context = {"path": path, "name": name, "metadata": {}, "record": record_from_parser}
         try:
             # Registered parsers may define parse(contents, context) with
             # takes_context=True (vidprep_bundle needs the path to find
@@ -414,25 +433,27 @@ class ParserRegistry:
                     result = asyncio.run(result)  # type: ignore[arg-type]
         except Exception as exc:  # noqa: BLE001 - one bad file must never kill the pipeline
             self._record_event(
-                file=name or path or suffix, path=path,
-                stage="parse", action="skip_file",
-                reason=f"parse failure ({kind!r}): {exc}", parser=kind,
+                file=name or path or suffix,
+                path=path,
+                stage="parse",
+                action="skip_file",
+                reason=f"parse failure ({kind!r}): {exc}",
+                parser=kind,
             )
             return []
         elements = self._normalize_elements(result, kind, name, path, suffix)
-        if (
-            not elements
-            and records_before == len(self._ingestion_records)
-            and contents.strip()
-        ):
+        if not elements and records_before == len(self._ingestion_records) and contents.strip():
             # Zero-chunk red flag (M2 D-M2-4): a successfully fetched,
             # non-empty file produced no chunks and said nothing — that's
             # always worth a record. Files that already recorded a
             # skip/drop don't double-record.
             self._record_event(
-                file=name or path or suffix, path=path,
-                stage="parse", action="zero_chunks",
-                reason="non-empty file produced no chunks", parser=kind,
+                file=name or path or suffix,
+                path=path,
+                stage="parse",
+                action="zero_chunks",
+                reason="non-empty file produced no chunks",
+                parser=kind,
             )
         return elements
 
@@ -463,9 +484,12 @@ class ParserRegistry:
             text = str(text) if text else ""
             if not text:
                 self._record_event(
-                    file=name or path or suffix, path=path,
-                    stage="parse", action="drop_chunk",
-                    reason="empty element text", parser=kind,
+                    file=name or path or suffix,
+                    path=path,
+                    stage="parse",
+                    action="drop_chunk",
+                    reason="empty element text",
+                    parser=kind,
                 )
                 continue
             meta = dict(meta) if meta else {}
@@ -478,31 +502,41 @@ class ParserRegistry:
                             break
                 except _parser_plugins.SkipFile as exc:
                     self._record_event(
-                        file=name or path or suffix, path=path,
-                        stage="normalize", action="skip_file",
-                        reason=exc.reason, parser=kind,
+                        file=name or path or suffix,
+                        path=path,
+                        stage="normalize",
+                        action="skip_file",
+                        reason=exc.reason,
+                        parser=kind,
                     )
                     return []
                 except _parser_plugins.DropChunk as exc:
                     self._record_event(
-                        file=name or path or suffix, path=path,
-                        stage=exc.stage, action="drop_chunk",
-                        reason=exc.reason, parser=kind,
+                        file=name or path or suffix,
+                        path=path,
+                        stage=exc.stage,
+                        action="drop_chunk",
+                        reason=exc.reason,
+                        parser=kind,
                         chunk_locator=exc.chunk_locator,
                     )
                     continue
                 except Exception as exc:  # noqa: BLE001 - defensive: a mapper bug must not kill the pipeline
                     self._record_event(
-                        file=name or path or suffix, path=path,
-                        stage="normalize", action="skip_file",
+                        file=name or path or suffix,
+                        path=path,
+                        stage="normalize",
+                        action="skip_file",
                         reason=f"metadata normalization failure ({kind!r}): {exc}",
                         parser=kind,
                     )
                     return []
                 if mapped is None:
                     self._record_event(
-                        file=name or path or suffix, path=path,
-                        stage="normalize", action="drop_chunk",
+                        file=name or path or suffix,
+                        path=path,
+                        stage="normalize",
+                        action="drop_chunk",
                         reason=f"no element mapper claimed this element ({kind!r})",
                         parser=kind,
                     )
@@ -563,7 +597,9 @@ class ParserRegistry:
         self._ingestion_records.append(rec)
         logger.warning(
             "Ingestion %s/%s %r%s — %s",
-            stage, action, file,
+            stage,
+            action,
+            file,
             f" ({chunk_locator})" if chunk_locator else "",
             reason,
         )
@@ -579,6 +615,13 @@ class ParserRegistry:
 # ---------------------------------------------------------------------------
 # Embedder / splitter builders (xpack)
 # ---------------------------------------------------------------------------
+
+
+def _float32_vectors(vectors: list[np.ndarray]) -> list[np.ndarray]:
+    """Return Pathway-compatible float32 vectors, preserving float32 arrays."""
+    return [
+        vector if vector.dtype == np.float32 else vector.astype(np.float32) for vector in vectors
+    ]
 
 
 def build_xpack_embedder(cfg) -> pw.UDF:
@@ -610,9 +653,7 @@ def build_xpack_embedder(cfg) -> pw.UDF:
     retries = extra.pop("retries", None)
     common: dict[str, Any] = {"cache_strategy": cache_strategy, **extra}
     if retries:
-        common["retry_strategy"] = pw.udfs.ExponentialBackoffRetryStrategy(
-            max_retries=int(retries)
-        )
+        common["retry_strategy"] = pw.udfs.ExponentialBackoffRetryStrategy(max_retries=int(retries))
     if cfg.model:
         common["model"] = cfg.model
 
@@ -623,14 +664,15 @@ def build_xpack_embedder(cfg) -> pw.UDF:
     if cfg.type in {"sentence_transformer", "sentencetransformer"}:
         model = common.pop("model", None) or "sentence-transformers/all-MiniLM-L6-v2"
         common.pop("cache_strategy", None)  # local model; caching adds little
-        udf = embedders.SentenceTransformerEmbedder(model=model, **common)
+
+        class VectorDbSentenceTransformerEmbedder(embedders.SentenceTransformerEmbedder):
+            def __wrapped__(self, input: list[str], **kwargs) -> list[np.ndarray]:
+                vectors = super().__wrapped__(input, **kwargs)
+                return _float32_vectors(vectors)
+
+        udf = VectorDbSentenceTransformerEmbedder(model=model, **common)
         # Local models are deterministic: the engine may re-run them on
         # retraction (cheap CPU) instead of memoizing every vector in RAM.
-        # The xpack constructor doesn't expose the flag (upstream PR pending),
-        # so it is set on the built UDF; the engine reads it at expression
-        # build time. API embedders stay memoized — a re-call costs money and
-        # is not guaranteed bit-stable. Model changes across restarts are
-        # guarded by the persistence fingerprint.
         udf.deterministic = True
         return udf
     if cfg.type == "gemini":
@@ -652,7 +694,10 @@ def build_xpack_splitter(cfg):
         chunk instead (single-chunk texts are left untouched)."""
 
         def chunk(
-            self, text: str, metadata: dict = {}, **kwargs  # noqa: B006 - mirrors the xpack splitter signature
+            self,
+            text: str,
+            metadata: dict = {},  # noqa: B006 - mirrors the xpack signature
+            **kwargs,
         ) -> list[tuple[str, dict]]:
             chunks = super().chunk(text, metadata, **kwargs)
             if len(chunks) >= 2 and len(chunks[-1][0]) < 100:
@@ -698,9 +743,7 @@ def build_graph(
 
     registry = ParserRegistry(config.parser)
     registry.check_rule_deps()
-    registry.report_writer = _IngestionReportWriter(
-        Path(config.indexer.ingestion_log_dir)
-    )
+    registry.report_writer = _IngestionReportWriter(Path(config.indexer.ingestion_log_dir))
     splitter = splitter if splitter is not None else build_xpack_splitter(config.splitter)
     embedder = embedder if embedder is not None else build_xpack_embedder(config.embedder)
 
@@ -709,9 +752,7 @@ def build_graph(
     # object is gone). DefaultCache persists parsed text across restarts on
     # disk when persistence is enabled (LRU-bounded; size from config). The
     # fetcher makes byte retrieval source-specific (local path vs Drive download).
-    cache_strategy = pw.udfs.DefaultCache(
-        size_limit=config.indexer.parse_cache_size_gb * 2**30
-    )
+    cache_strategy = pw.udfs.DefaultCache(size_limit=config.indexer.parse_cache_size_gb * 2**30)
 
     def make_parse_udf(fetcher: Fetcher):
         @pw.udf(deterministic=False, cache_strategy=cache_strategy)
@@ -724,13 +765,16 @@ def build_graph(
                 registry._record_event(
                     file=str(meta.get("name", "")),
                     path=str(meta.get("path", "")),
-                    stage="fetch", action="skip_file",
+                    stage="fetch",
+                    action="skip_file",
                     reason=f"fetch failure: {exc}",
                 )
                 return []
             return registry.parse(
-                contents, suffix,
-                str(meta.get("name", "")), str(meta.get("path", "")),
+                contents,
+                suffix,
+                str(meta.get("name", "")),
+                str(meta.get("path", "")),
             )
 
         return parse_document
@@ -752,7 +796,14 @@ def build_graph(
     # memoize its outputs (a full extra copy of the corpus in RAM). Guarded
     # against config/library drift by the persistence fingerprint (see
     # fingerprint.py). Unknown/future splitter types fall back to memoization.
-    _PURE_SPLITTERS = {"token_count", "tokencount", "recursive", "recursive_character", "null", "none"}
+    _PURE_SPLITTERS = {
+        "token_count",
+        "tokencount",
+        "recursive",
+        "recursive_character",
+        "null",
+        "none",
+    }
     split_is_pure = config.splitter.type in _PURE_SPLITTERS
 
     @pw.udf(deterministic=split_is_pure)
@@ -815,9 +866,7 @@ def build_graph(
         )
 
     parsed = (
-        parsed_tables[0]
-        if len(parsed_tables) == 1
-        else pw.Table.concat_reindex(*parsed_tables)
+        parsed_tables[0] if len(parsed_tables) == 1 else pw.Table.concat_reindex(*parsed_tables)
     )
 
     # -- split -> flatten -> embed -------------------------------------------
@@ -1128,9 +1177,7 @@ def persistence_config(config: ServietteConfig):
     return pw.persistence.Config(backend)
 
 
-def run_indexer(
-    config: ServietteConfig, *, prepare: bool = True, **build_kwargs: Any
-) -> None:
+def run_indexer(config: ServietteConfig, *, prepare: bool = True, **build_kwargs: Any) -> None:
     """Prepare the backend, build the graph and run it (streaming).
 
     ``prepare=False`` is used by spawned worker processes: the spawn parent
@@ -1168,9 +1215,7 @@ def run_indexer(
     if config.indexer.monitoring_http_port:
         # The engine's own observability server (Rust, per worker process):
         # GET /status and GET /metrics (Prometheus) on 127.0.0.1:(base + id).
-        os.environ["PATHWAY_MONITORING_HTTP_PORT"] = str(
-            config.indexer.monitoring_http_port
-        )
+        os.environ["PATHWAY_MONITORING_HTTP_PORT"] = str(config.indexer.monitoring_http_port)
         run_kwargs["with_http_server"] = True
     # The interactive monitoring dashboard redraws the terminal with escape
     # codes; under `serviette up` both children share one console and it would

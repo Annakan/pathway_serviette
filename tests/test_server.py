@@ -100,12 +100,11 @@ def test_litellm_routes_through_litellm_not_openai_client(store_path, mock_serve
 
     async def fake_acompletion(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="answer"))]
-        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="answer"))])
 
-    with _client(store_path, mock_server_embedder, llm=llm) as client, patch(
-        "litellm.acompletion", new=AsyncMock(side_effect=fake_acompletion)
+    with (
+        _client(store_path, mock_server_embedder, llm=llm) as client,
+        patch("litellm.acompletion", new=AsyncMock(side_effect=fake_acompletion)),
     ):
         resp = client.post("/api/v1/rag", json={"query": "tell me about cats", "k": 2})
 
@@ -115,6 +114,60 @@ def test_litellm_routes_through_litellm_not_openai_client(store_path, mock_serve
     assert captured["api_key"] == "sk-test-openrouter-key"
     assert "base_url" not in captured
     assert resp.json()["answer"] == "answer"
+
+
+def test_litellm_embedder_routes_provider_request_parameters():
+    """Indexer and query server must use the same LiteLLM model route."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from serviette.server.embedder import LiteLLMAsyncEmbedder, build_embedder
+
+    embedder = build_embedder(
+        EmbedderConfig(
+            type="litellm",
+            model="openrouter/qwen/qwen3-embedding-0.6b",
+            api_key="sk-test-openrouter-key",
+            api_base="https://openrouter.ai/api/v1",
+            dimensions=1024,
+            capacity=4,
+            retries=8,
+            query_prefix="query-only: ",
+        )
+    )
+    assert isinstance(embedder, LiteLLMAsyncEmbedder)
+    captured: dict = {}
+
+    async def fake_aembedding(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(data=[{"embedding": [0.1, 0.2]}])
+
+    with patch("litellm.aembedding", new=AsyncMock(side_effect=fake_aembedding)):
+        vector = asyncio.run(embedder.embed("test query"))
+
+    assert vector == [0.1, 0.2]
+    assert captured == {
+        "model": "openrouter/qwen/qwen3-embedding-0.6b",
+        "api_key": "sk-test-openrouter-key",
+        "input": ["test query"],
+        "api_base": "https://openrouter.ai/api/v1",
+        "dimensions": 1024,
+    }
+
+
+def test_local_embedder_vectors_are_float32_for_pathway_without_extra_copy():
+    import numpy as np
+
+    from serviette.indexer.graph import _float32_vectors
+
+    half = [np.array([1.0, 2.0], dtype=np.float16)]
+    converted = _float32_vectors(half)
+    assert converted[0].dtype == np.float32
+    assert converted[0].tolist() == [1.0, 2.0]
+
+    single = np.array([1.0, 2.0], dtype=np.float32)
+    assert _float32_vectors([single])[0] is single
 
 
 def test_legacy_unversioned_aliases_still_work(store_path, mock_server_embedder):
@@ -254,9 +307,7 @@ def test_reranker_reorders_and_gets_shortlist(store_path, mock_server_embedder):
     )
     accessor = DuckDbAccessor(config.vector_db)
     reranker = _ReverseReranker()
-    app = create_app(
-        config, embedder=mock_server_embedder, accessor=accessor, reranker=reranker
-    )
+    app = create_app(config, embedder=mock_server_embedder, accessor=accessor, reranker=reranker)
     with TestClient(app) as client:
         resp = client.post("/api/v1/retrieve", json={"query": DOCS[0], "k": 2})
     assert resp.status_code == 200

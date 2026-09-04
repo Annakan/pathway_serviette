@@ -65,9 +65,12 @@ def test_tilde_paths_expand_but_not_rebase(tmp_path, monkeypatch):
 def test_non_duckdb_non_fs_and_disabled_persistence_untouched(tmp_path):
     data = {
         "sources": [
-            {"type": "gdrive", "object_id": "drive-folder-id",
-             "service_user_credentials_file": "creds.json",
-             "file_name_pattern": "*.pdf"}
+            {
+                "type": "gdrive",
+                "object_id": "drive-folder-id",
+                "service_user_credentials_file": "creds.json",
+                "file_name_pattern": "*.pdf",
+            }
         ],
         "vector_db": {"type": "qdrant", "collection": "c"},
         "persistence": {"enabled": False, "path": "state"},
@@ -86,3 +89,42 @@ def test_load_config_dict_keeps_relative_verbatim():
     assert cfg.vector_db.path == "store.duckdb"
     assert cfg.persistence.path == "state"
     assert cfg.indexer.ingestion_log_dir == "log"
+
+
+def test_parser_rule_unless_env_retains_rule_on_mismatch(monkeypatch):
+    monkeypatch.delenv("ENABLE_PAID_PARSER", raising=False)
+
+    cfg = load_config_dict(
+        {
+            "parser": [
+                {
+                    "match": ["*.video"],
+                    "type": "skip",
+                    "unless_env": {"ENABLE_PAID_PARSER": "1"},
+                }
+            ]
+        }
+    )
+
+    assert cfg.parser is not None
+    assert [rule.type for rule in cfg.parser] == ["skip"]
+
+
+def test_parser_rule_unless_env_omits_rule_on_exact_trimmed_match(monkeypatch):
+    monkeypatch.setenv("ENABLE_PAID_PARSER", " 1 ")
+
+    cfg = load_config_dict(
+        {
+            "parser": [
+                {
+                    "match": ["*.video"],
+                    "type": "skip",
+                    "unless_env": {"ENABLE_PAID_PARSER": "1"},
+                },
+                {"match": ["*.txt"], "type": "utf8"},
+            ]
+        }
+    )
+
+    assert cfg.parser is not None
+    assert [rule.type for rule in cfg.parser] == ["utf8"]
